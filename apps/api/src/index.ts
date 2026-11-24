@@ -1060,11 +1060,13 @@ export async function createApiServer(options: ServerOptions) {
       };
     }
 
+    fix/285-request-error-boundary
     // Issue #285: top-level error boundary for request handling. Any
     // unexpected throw below — auth routes, authentication, or any routed
     // handler — becomes a 500 in the standard error envelope instead of a
     // hung request. The X-Request-Id header is already set above, and the
     // response body carries only the generic INTERNAL_ERROR message.
+
     try {
     // Phase 28U: USER AUTH routes (/auth/*) — handled before the auth gate.
     // These are the login/session endpoints (register, login, challenge,
@@ -1220,8 +1222,10 @@ export async function createApiServer(options: ServerOptions) {
     }); // End als.run
     }); // End runRequestIdContext
     } catch (err: unknown) {
+    fix/285-request-error-boundary
       // The throw is logged server-side with the request id; the client
       // only ever sees the generic INTERNAL_ERROR envelope.
+
       log("error", "unhandled request error", {
         requestId,
         method,
@@ -2430,10 +2434,12 @@ export async function createApiServer(options: ServerOptions) {
           createdAt: now,
           updatedAt: now,
         };
+        fix/285-request-error-boundary
         // Issue #285: await the enqueue so a queue-store failure is visible
         // to the caller instead of a false 200 claiming the execution was
         // queued. The approval itself stays approved; only the enqueue is
         // reported as failed.
+
         try {
           await executionQueue.enqueue(executionRecord);
         } catch (err: unknown) {

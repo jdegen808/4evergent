@@ -76,7 +76,7 @@ a.getAccount('<YOUR_PUBLIC_KEY>').then(acc => {
 ### 6. Run tests (deterministic, no secrets required)
 
 ```bash
-pnpm test  # 290 tests PASS
+pnpm test
 ```
 
 ### 7. Run simulation (no submission)
@@ -205,7 +205,7 @@ Always run cargo from `contracts/` so the pinned toolchain and `Cargo.lock` appl
 ```bash
 cd contracts
 cargo test --locked
-cargo +1.81.0 test --locked                     # 15 unit tests expected
+cargo +1.81.0 test --locked
 stellar contract build                          # wasm artifact + optimized hash printed
 ```
 

@@ -48,7 +48,7 @@ export interface EvaluateOptions {
 export class PolicyEngine {
   private defaultRules: PolicyRules;
   private activityStore?: {
-    listByAgent: (agentId: string, limit?: number) => Promise<ActivityRecord[]>;
+    listByAgent: (agentId: string, limit?: number, offset?: number) => Promise<ActivityRecord[]>;
     reserveDailySpending?: (agentId: string, asset: string, amount: string, limit: string) => Promise<boolean>;
     releaseDailySpending?: (agentId: string, asset: string, amount: string) => Promise<void>;
     /** Reservation-table total for the current UTC day (single source of "spent", #353). */
@@ -59,7 +59,7 @@ export class PolicyEngine {
   constructor(
     rules?: Partial<PolicyRules>,
     activityStore?: {
-      listByAgent: (agentId: string, limit?: number) => Promise<ActivityRecord[]>;
+      listByAgent: (agentId: string, limit?: number, offset?: number) => Promise<ActivityRecord[]>;
       reserveDailySpending?: (agentId: string, asset: string, amount: string, limit: string) => Promise<boolean>;
       releaseDailySpending?: (agentId: string, asset: string, amount: string) => Promise<void>;
       getDailySpending?: (agentId: string, asset: string, now?: Date) => Promise<number | null>;
@@ -311,7 +311,7 @@ export class PolicyEngine {
   private async getReservedTotal(asset: string, agentId: string): Promise<number | null> {
     if (!this.activityStore?.getDailySpending) return null;
     const total = await this.activityStore.getDailySpending(agentId, asset);
-    return total ?? 0;
+    return total ?? null;
   }
 
   /**
@@ -323,27 +323,50 @@ export class PolicyEngine {
    * Only activities with status "submitted" are counted. Pending, rejected,
    * and failed activities do NOT count toward the daily limit.
    */
-  private async getDailySpent(asset: string, agentId: string): Promise<number> {
+  async getDailySpent(asset: string, agentId: string): Promise<number> {
     if (!this.activityStore) return 0;
 
     const now = new Date();
     const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
     const startOfDayIso = startOfDay.toISOString();
 
-    const activities = await this.activityStore.listByAgent(agentId, 200);
-
+    const PAGE_SIZE = 200;
+    let offset = 0;
     let total = 0;
-    for (const activity of activities) {
-      if (activity.status !== "submitted") continue;
-      if (activity.createdAt < startOfDayIso) continue;
-      const activityAsset = extractAsset(activity.intent);
-      if (activityAsset !== asset) continue;
-      const amount = extractAmount(activity.intent);
-      if (amount !== null) {
-        // Malformed stored amounts contribute 0 rather than the
-        // parseFloat-truncated value, so the gate and the ledger agree.
-        total += toStroops(amount) ?? 0;
+    let previousFirstId: string | null = null;
+
+    while (true) {
+      const activities = await this.activityStore.listByAgent(agentId, PAGE_SIZE, offset);
+      if (!activities || activities.length === 0) break;
+
+      // Guard against minimal test doubles that ignore offset and return the same slice
+      if (offset > 0 && activities[0]?.id === previousFirstId) {
+        break;
       }
+      previousFirstId = activities[0]?.id ?? null;
+
+      let reachedEarlierDay = false;
+      for (const activity of activities) {
+        if (activity.createdAt < startOfDayIso) {
+          reachedEarlierDay = true;
+          break;
+        }
+        if (activity.status !== "submitted") continue;
+        const activityAsset = extractAsset(activity.intent);
+        if (activityAsset !== asset) continue;
+        const amount = extractAmount(activity.intent);
+        if (amount !== null) {
+          // Malformed stored amounts contribute 0 rather than the
+          // parseFloat-truncated value, so the gate and the ledger agree.
+          total += toStroops(amount) ?? 0;
+        }
+      }
+
+      if (reachedEarlierDay || activities.length < PAGE_SIZE) {
+        break;
+      }
+
+      offset += activities.length;
     }
 
     return total;

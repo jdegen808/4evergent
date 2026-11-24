@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import type { ExecutionStore, ExecutionRecord, ExecutionStatus } from "./execution-types.js";
+import type { ExecutionStore, ExecutionRecord, ExecutionStatus, ExecutionAttentionCounts } from "./execution-types.js";
 import { getSharedConnection, closeSharedConnection } from "./shared-connection.js";
 import { clampOffset, clampLimit } from "./pagination.js";
 import { ensureColumn, MigrationError } from "./migration.js";
@@ -103,6 +103,38 @@ export class InMemoryExecutionStore implements ExecutionStore {
       }
     }
     return result;
+  }
+
+  /**
+   * #359: attention counts for the Overview "Needs Attention" table.
+   *
+   * retrying — mirrors inferRetrying in
+   *   apps/web/src/pages/Executions.tsx:46 and
+   *   apps/web/src/pages/ExecutionList.tsx:90 exactly:
+   *     status === 'failed' && nextRetryAt !== null && errorClass === 'transient'
+   *   A `queued` record never qualifies: it has never failed, which is the
+   *   exact false positive the pre-#359 count produced (execCounts.queued).
+   *
+   * stuck — `executing` rows whose startedAt is strictly older than the
+   *   caller's cutoff. Young in-flight rows are healthy, not stuck.
+   *   startedAt === null is excluded: age is unknown, do not guess.
+   */
+  async countAttentionByOwner(
+    ownerId: string,
+    opts: { stuckOlderThan: string }
+  ): Promise<ExecutionAttentionCounts> {
+    let retrying = 0;
+    let stuck = 0;
+    for (const r of this.records.values()) {
+      if (r.ownerId !== ownerId) continue;
+      if (r.status === "failed" && r.nextRetryAt !== null && r.errorClass === "transient") {
+        retrying++;
+      }
+      if (r.status === "executing" && r.startedAt !== null && r.startedAt < opts.stuckOlderThan) {
+        stuck++;
+      }
+    }
+    return { retrying, stuck };
   }
 
   async update(id: string, patch: Partial<ExecutionRecord>): Promise<ExecutionRecord | null> {
@@ -425,6 +457,32 @@ export class SQLiteExecutionStore implements ExecutionStore {
       if (s in result) result[s] = row.count;
     }
     return result;
+  }
+
+  /**
+   * #359: two COUNT(*) queries matching the InMemory predicates exactly.
+   * Timestamps are stored canonical-ISO (toCanonicalIso on write), so
+   * lexicographic `<` is a correct chronological comparison.
+   */
+  async countAttentionByOwner(
+    ownerId: string,
+    opts: { stuckOlderThan: string }
+  ): Promise<ExecutionAttentionCounts> {
+    // retrying — failed + nextRetryAt + transient errorClass. A queued row
+    // is excluded by `status = 'failed'` — that is the fix (#359).
+    const retryingRow = this.db
+      .prepare(
+        "SELECT COUNT(*) as c FROM executions WHERE owner_id = ? AND status = 'failed' AND next_retry_at IS NOT NULL AND error_class = 'transient'"
+      )
+      .get(ownerId) as unknown as { c: number };
+    // stuck — executing + startedAt strictly older than cutoff.
+    // started_at IS NOT NULL keeps "age unknown" out of the count.
+    const stuckRow = this.db
+      .prepare(
+        "SELECT COUNT(*) as c FROM executions WHERE owner_id = ? AND status = 'executing' AND started_at IS NOT NULL AND started_at < ?"
+      )
+      .get(ownerId, opts.stuckOlderThan) as unknown as { c: number };
+    return { retrying: retryingRow.c, stuck: stuckRow.c };
   }
 
   async update(id: string, patch: Partial<ExecutionRecord>): Promise<ExecutionRecord | null> {
