@@ -30,6 +30,7 @@ export const API_ERRORS = {
   APPROVAL_CONFLICT: { status: 409, message: "Approval state changed; please refresh", description: "The approval was decided concurrently by another request." },
   APPROVAL_EXPIRED: { status: 410, message: "Approval expired", description: "The approval passed its expiry before it was approved." },
   RATE_LIMITED: { status: 429, message: "rate_limited", description: "Too many requests from this source. Retry after the number of seconds indicated in the Retry-After response header." },
+  INTERNAL_ERROR: { status: 500, message: "internal_error", description: "An unexpected server error occurred." },
 } as const;
 
 export type ApiErrorCode = keyof typeof API_ERRORS;
