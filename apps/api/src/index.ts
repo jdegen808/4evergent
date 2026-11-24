@@ -23,7 +23,7 @@ import { ExecutionRecoveryService } from "./execution-recovery.js";
 import { ScheduleRecoveryService } from "./schedule-recovery.js";
 import { TransactionStatusReconciler, ApprovalRecoveryService, DEFAULT_SUBMITTED_MAX_AGE_MS } from "@4evergent/stellar";
 import { AccountSequenceCoordinator } from "./account-sequence-coordinator.js";
-import type { ExecutionRecord, ExecutionStatus, ScheduleRecord } from "@4evergent/database";
+import type { ExecutionRecord, ScheduleRecord } from "@4evergent/database";
 import type { ScheduleExecutionResult } from "./schedule-execution.js";
 import {
   InMemoryActivityStore,
@@ -69,6 +69,19 @@ const require = createRequire(import.meta.url);
 export const API_VERSION: string = (require("../package.json") as { version: string }).version;
 
 const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
+
+/**
+ * #359: age threshold above which an `executing` execution counts as
+ * "stuck" on the Overview Needs Attention table. A younger in-flight
+ * execution is healthy, not stuck. The predicate is strictly
+ * `startedAt < (now - STUCK_EXECUTION_THRESHOLD_MS)`, so a startedAt
+ * exactly at the cutoff is NOT yet stuck.
+ *
+ * Exported so tests can build fixtures at the exact boundary without
+ * duplicating the numeric literal (drift between test and prod would
+ * recreate the very bug this constant exists to prevent).
+ */
+export const STUCK_EXECUTION_THRESHOLD_MS = 10 * 60_000;
 
 interface IntentResponse {
   activityId: string;
@@ -2004,15 +2017,28 @@ export async function createApiServer(options: ServerOptions) {
 
   async function handleGetOverviewAttention(ctx: RequestContext, _req: any, res: any) {
     const ownerId = ctx.ownerId!;
-    const pendingApprovals = await approvals.countByOwner(ownerId, "pending_approval");
-    const execCounts: Record<ExecutionStatus, number> =
-      await executionStore.countByOwner(ownerId);
+    // #359: retrying and stuck are DEFINITIONAL, not status-derived. Before
+    // this fix, `retryingExecutions` was literally `execCounts.queued` and
+    // `stuckExecutions` was `execCounts.executing` — so any healthy queue
+    // entry looked "retrying" and any young in-flight execution looked
+    // "stuck". The predicates now live in the store (`countAttentionByOwner`)
+    // so Overview and the Executions page (inferRetrying in
+    // apps/web/src/pages/Executions.tsx) share exactly one definition.
+    //
+    // pending/failed/dead-letter still come from `countByOwner` below. Their
+    // semantics are unchanged — this fix touches only retrying and stuck.
+    const stuckOlderThan = new Date(Date.now() - STUCK_EXECUTION_THRESHOLD_MS).toISOString();
+    const [pendingApprovals, execCounts, attention] = await Promise.all([
+      approvals.countByOwner(ownerId, "pending_approval"),
+      executionStore.countByOwner(ownerId),
+      executionStore.countAttentionByOwner(ownerId, { stuckOlderThan }),
+    ]);
     return json(res, {
       pendingApprovals,
       failedExecutions: execCounts.failed ?? 0,
       deadLetterExecutions: execCounts.dead_letter ?? 0,
-      retryingExecutions: execCounts.queued ?? 0,
-      stuckExecutions: execCounts.executing ?? 0,
+      retryingExecutions: attention.retrying,
+      stuckExecutions: attention.stuck,
     });
   }
 

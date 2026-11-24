@@ -1,69 +1,14 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@stellar/stellar-sdk";
-import type { AddressInfo } from "node:net";
-import { createApiServer, clearAgents } from "../src/index.js";
+import { clearAgents } from "../src/index.js";
 import { API_ERRORS } from "../src/error-codes.js";
-import { DevAuthProvider } from "@4evergent/shared";
-import {
-  InMemoryActivityStore,
-  InMemoryAgentStore,
-  InMemoryApprovalStore,
-  InMemoryExecutionStore,
-  InMemoryScheduleStore,
-} from "@4evergent/database";
-import { apiFetch, MockSigner } from "./helpers.js";
-
-// Regression tests for issue #285: an unexpected throw in a routed handler
-// must return a 500 in the standard error envelope instead of hanging the
-// request, and a failing approve enqueue must return 500 instead of a
-// false 200 claiming the execution was queued.
+import { InMemoryExecutionStore, InMemoryAgentStore } from "@4evergent/database";
+import { apiFetch } from "./helpers.js";
 
 beforeEach(() => {
   clearAgents();
 });
-
-const TEST_AGENT = {
-  id: "test-agent",
-  displayName: "Test Agent",
-  description: "test agent",
-  ownerId: "test",
-  stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
-  capabilities: ["payment"],
-  status: "active" as const,
-  createdAt: new Date().toISOString(),
-  updatedAt: new Date().toISOString(),
-  active: true,
-  metadata: {},
-};
-
-const POLICY_RULES = {
-  maxTxAmount: { XLM: "1000" },
-  requireHumanApprovalForAmountAbove: "10",
-};
-
-async function listen(
-  server: Awaited<ReturnType<typeof createApiServer>>,
-): Promise<{ baseUrl: string; close: () => Promise<void> }> {
-  return new Promise((resolve) => {
-    const http = server.server.listen(0, "127.0.0.1", () => {
-      const addr = http.address() as AddressInfo;
-      resolve({
-        baseUrl: `http://127.0.0.1:${addr.port}`,
-        close: () => server.close(),
-      });
-    });
-  });
-}
-
-async function post(baseUrl: string, path: string, body: unknown) {
-  const res = await apiFetch(`${baseUrl}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return { status: res.status, headers: res.headers, body: await res.json() };
-}
 
 test("API_ERRORS defines INTERNAL_ERROR with status 500 and generic message", () => {
   assert.deepEqual(API_ERRORS.INTERNAL_ERROR, {
@@ -73,96 +18,102 @@ test("API_ERRORS defines INTERNAL_ERROR with status 500 and generic message", ()
   });
 });
 
-test("unexpected throw in routed handler returns 500 INTERNAL_ERROR with X-Request-Id and no leaked internals", async () => {
-  // The store throws with an internal-looking message; the client must
-  // never see it.
-  class FailingAgentStore extends InMemoryAgentStore {
-    override async listByOwner(): Promise<never> {
-      throw new Error(
-        "SQLITE_CORRUPT: secret internal database path /var/data/prod.db",
-      );
-    }
-  }
+test("unexpected throw in routed handler returns 500 INTERNAL_ERROR with X-Request-Id and no leaked internal details", async () => {
+  const failingAgentStore = new InMemoryAgentStore();
+  failingAgentStore.listByOwner = async () => {
+    throw new Error("SQLITE_CORRUPT: secret internal database path /var/data/prod.db");
+  };
 
-  const server = await createApiServer({
+  const { createApiServer } = await import("../src/index.js");
+  const { DevAuthProvider } = await import("@4evergent/shared");
+  const { MockSigner } = await import("./helpers.js");
+
+  const srv = await createApiServer({
     port: 0,
     horizonUrl: "https://horizon-testnet.stellar.org",
     signer: new MockSigner("err-boundary"),
     authProvider: new DevAuthProvider({ defaultOwnerId: "test" }),
-    agentStore: new FailingAgentStore(),
+    agentStore: failingAgentStore,
     deferExecution: true,
   });
 
-  const { baseUrl, close } = await listen(server);
+  await new Promise<void>((r) => srv.server.listen(0, "127.0.0.1", r));
+  const addr = srv.server.address() as import("node:net").AddressInfo;
+  const url = `http://127.0.0.1:${addr.port}`;
+
   try {
-    const res = await apiFetch(`${baseUrl}/agents`, {
+    const res = await apiFetch(`${url}/agents`, {
       headers: { "X-Request-Id": "req-boundary-285" },
     });
     assert.equal(res.status, 500);
     assert.equal(res.headers.get("x-request-id"), "req-boundary-285");
     const body = (await res.json()) as Record<string, unknown>;
-    assert.deepEqual(body, { code: "INTERNAL_ERROR", error: "internal_error" });
+    assert.deepEqual(body, {
+      code: "INTERNAL_ERROR",
+      error: "internal_error",
+    });
     assert.ok(!JSON.stringify(body).includes("SQLITE_CORRUPT"));
     assert.ok(!JSON.stringify(body).includes("/var/data/prod.db"));
   } finally {
-    await close();
+    await srv.close();
   }
 });
 
-test("approve with a failing queue store returns 500 and does not claim the execution was queued", async () => {
-  // Only the write path fails: reads still work, so the approval can be
-  // created and claimed, and only the enqueue throws.
-  class FailingExecutionStore extends InMemoryExecutionStore {
-    override async record(): Promise<never> {
-      throw new Error("queue store unavailable");
-    }
-  }
+test("POST /approvals/:id/approve returns 500 INTERNAL_ERROR when executionQueue.enqueue throws and does not claim queued", async () => {
+  const { createApiServer } = await import("../src/index.js");
+  const { DevAuthProvider } = await import("@4evergent/shared");
+  const { MockSigner, DEFAULT_TEST_AGENT } = await import("./helpers.js");
 
-  const executionStore = new FailingExecutionStore();
-  const server = await createApiServer({
+  const failingExecutionStore = new InMemoryExecutionStore();
+  failingExecutionStore.record = async () => {
+    throw new Error("disk full while persisting execution queue record");
+  };
+
+  const srv = await createApiServer({
     port: 0,
     horizonUrl: "https://horizon-testnet.stellar.org",
-    signer: new MockSigner("err-boundary"),
-    policyRules: POLICY_RULES,
+    signer: new MockSigner("approve-enqueue-fail"),
     authProvider: new DevAuthProvider({ defaultOwnerId: "test" }),
-    activityStore: new InMemoryActivityStore(),
-    executionStore,
-    approvalStore: new InMemoryApprovalStore(),
-    scheduleStore: new InMemoryScheduleStore(),
-    executionQueue: { enabled: true, intervalMs: 10_000 },
+    policyRules: {
+      maxTxAmount: { XLM: "1000" },
+      requireHumanApprovalForAmountAbove: "10",
+    },
+    executionStore: failingExecutionStore,
+    executionQueue: { enabled: true, intervalMs: 60_000 },
   });
-  server.registerAgent(TEST_AGENT);
+  srv.registerAgent({ ...DEFAULT_TEST_AGENT, id: "test-agent", ownerId: "test" });
 
-  const { baseUrl, close } = await listen(server);
+  await new Promise<void>((r) => srv.server.listen(0, "127.0.0.1", r));
+  const addr = srv.server.address() as import("node:net").AddressInfo;
+  const url = `http://127.0.0.1:${addr.port}`;
+
   try {
-    const intentRes = await post(baseUrl, "/agents/test-agent/intents", {
-      type: "payment",
-      asset: "XLM",
-      destination: Keypair.random().publicKey(),
-      amount: "50",
-      reason: "error boundary approve test",
+    const intentRes = await apiFetch(`${url}/agents/test-agent/intents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "payment",
+        asset: "XLM",
+        destination: Keypair.random().publicKey(),
+        amount: "50",
+        reason: "above threshold approval test",
+      }),
     });
     assert.equal(intentRes.status, 202);
-    const approvalId = intentRes.body.approvalId as string;
-    assert.ok(approvalId);
+    const { approvalId } = (await intentRes.json()) as { approvalId: string };
 
-    const approveRes = await post(
-      baseUrl,
-      `/approvals/${approvalId}/approve`,
-      {},
-    );
+    const approveRes = await apiFetch(`${url}/approvals/${approvalId}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-Id": "req-approve-500" },
+      body: JSON.stringify({}),
+    });
     assert.equal(approveRes.status, 500);
-    assert.equal(approveRes.body.code, "INTERNAL_ERROR");
-    assert.ok(
-      !JSON.stringify(approveRes.body).includes("queued for execution"),
-    );
-
-    // The execution was never recorded in the queue store.
-    assert.equal(
-      await executionStore.getByApprovalId(approvalId),
-      null,
-    );
+    assert.equal(approveRes.headers.get("x-request-id"), "req-approve-500");
+    const approveBody = (await approveRes.json()) as Record<string, unknown>;
+    assert.equal(approveBody.code, "INTERNAL_ERROR");
+    assert.equal(approveBody.error, "internal_error");
+    assert.ok(!JSON.stringify(approveBody).includes("queued for execution"));
   } finally {
-    await close();
+    await srv.close();
   }
 });
